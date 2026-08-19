@@ -62,14 +62,14 @@ GEMINI_TIMEOUT_MS = int(os.getenv("GEMINI_TIMEOUT_MS", "22000"))
 
 # Origin allow-list. Explicit entries only — never "*" on a credentialed API.
 ALLOWED_ORIGINS: List[str] = [
-    "[aldyro.com](https://aldyro.com)",
-    "[aldyro.com](https://www.aldyro.com)",
-    "[localhost](http://localhost:3000)",
-    "[127.0.0.1](http://127.0.0.1:3000)",
-    "[localhost](http://localhost:5173)",
-    "[127.0.0.1](http://127.0.0.1:5173)",
-    "[localhost](http://localhost:8000)",
-    "[127.0.0.1](http://127.0.0.1:8000)",
+    "https://aldyro.com",
+    "https://www.aldyro.com",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
 ]
 
 # Exact wire payload for an exhausted quota (contract with the frontend).
@@ -187,7 +187,7 @@ class AuditRequest(BaseModel):
     def _clean_url(cls, v: str) -> str:
         v = v.strip()
         if not re.match(r"^https?://", v, flags=re.IGNORECASE):
-            v = f"[{v}](https://{v})"
+            v = f"https://{v}"
 
         parsed = urlparse(v)
         if parsed.scheme not in ("http", "https") or not parsed.hostname:
@@ -506,7 +506,7 @@ async def health() -> JSONResponse:
     )
 
 
-@app.post("/api/v1/geo-audit")
+@app.post("/geo-audit")
 async def geo_audit(payload: AuditRequest, request: Request) -> JSONResponse:
     """
     Primary audit route.
