@@ -2,7 +2,8 @@
 Aldyro.com — Section 2 "GEO AI Audit Terminal"
 ==============================================
 Dedicated FastAPI proxy engine between the public audit widget and the
-Google GenAI inference layer (gemini-2.5-flash-lite).
+Google GenAI inference layer (gemini-3.5-flash-lite, with an automatic
+fallback chain if the configured model becomes unavailable).
 
 Design constraints:
   * Zero secrets in source. GEMINI_API_KEY is read from process env only.
@@ -47,7 +48,21 @@ log = logging.getLogger("aldyro.geo-audit")
 # ---------------------------------------------------------------------------
 # 2. CONFIGURATION (all tunables in one place, all overridable by env)
 # ---------------------------------------------------------------------------
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+# Primary model. Current stable Gemini generation as of Aug 2026 is 3.x —
+# the 2.0 family (gemini-2.0-flash, gemini-2.0-flash-lite) was shut down
+# June 1, 2026 and now 404s on every call. gemini-3.5-flash-lite is the
+# same speed/cost tier as the original gemini-2.5-flash-lite default, on
+# the current generation.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+
+# Ordered fallback chain: if the primary model id 404s (retired, typo'd,
+# or region-gated), the engine automatically retries the next entry
+# instead of failing the whole request. The configured GEMINI_MODEL is
+# always tried first; duplicates are collapsed while preserving order.
+# Override with a comma-separated list via GEMINI_MODEL_FALLBACKS.
+_FALLBACK_RAW = os.getenv("GEMINI_MODEL_FALLBACKS", "gemini-2.5-flash-lite,gemini-2.5-flash")
+_FALLBACK_CANDIDATES = [GEMINI_MODEL] + [m.strip() for m in _FALLBACK_RAW.split(",") if m.strip()]
+GEMINI_MODEL_CHAIN: Tuple[str, ...] = tuple(dict.fromkeys(_FALLBACK_CANDIDATES))
 
 # Quota boundary: 2 evaluation scans per unique IP per rolling 24h window.
 RATE_LIMIT_MAX = int(os.getenv("RATE_LIMIT_MAX", "2"))
@@ -491,6 +506,53 @@ def build_user_prompt(brand_name: str, target_url: str) -> str:
     )
 
 
+async def generate_audit_completion(brand_name: str, target_url: str) -> str:
+    """
+    Call the inference layer, walking GEMINI_MODEL_CHAIN in order.
+
+    If a model id returns a 404 (retired, mistyped, or not enabled for this
+    API key), the next candidate in the chain is tried automatically instead
+    of failing the whole request. Any other upstream error (429, 500, etc.)
+    is raised immediately — those aren't a "wrong model id" problem and
+    should surface as the existing 502 UPSTREAM_INFERENCE_FAILURE response.
+    """
+    client = get_genai_client()
+    prompt = build_user_prompt(brand_name, target_url)
+    last_error: Optional[genai_errors.APIError] = None
+
+    for model_id in GEMINI_MODEL_CHAIN:
+        try:
+            response = await client.aio.models.generate_content(
+                model=model_id,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_INSTRUCTION,
+                    temperature=0.35,            # Low variance for repeatable scoring.
+                    top_p=0.9,
+                    max_output_tokens=2048,
+                    response_mime_type="application/json",
+                    response_schema=GeoAuditResult,   # Hard structural guarantee.
+                ),
+            )
+        except genai_errors.APIError as exc:
+            if getattr(exc, "code", None) == 404:
+                log.warning("Model '%s' returned 404, trying next in chain", model_id)
+                last_error = exc
+                continue
+            raise  # non-404 upstream fault: don't mask it, let it 502 as before
+
+        if model_id != GEMINI_MODEL_CHAIN[0]:
+            log.warning("Primary model unavailable; served via fallback model=%s", model_id)
+
+        raw_text = (response.text or "").strip()
+        if not raw_text:
+            raise ValueError("empty completion returned by the inference layer")
+        return raw_text
+
+    # Every candidate in the chain 404'd.
+    raise last_error or RuntimeError("no configured Gemini model was reachable")
+
+
 # ---------------------------------------------------------------------------
 # 9. ROUTES
 # ---------------------------------------------------------------------------
@@ -501,6 +563,7 @@ async def health() -> JSONResponse:
         {
             "status": "OPERATIONAL",
             "model": GEMINI_MODEL,
+            "model_chain": list(GEMINI_MODEL_CHAIN),
             "credential_bound": bool(os.getenv("GEMINI_API_KEY")),
         }
     )
@@ -514,7 +577,8 @@ async def geo_audit(payload: AuditRequest, request: Request) -> JSONResponse:
     Order of operations is deliberate:
       1. Validate input (Pydantic, already done by the time we get here).
       2. Enforce the per-IP quota — no upstream token is spent past the limit.
-      3. Call the inference layer with a constrained response schema.
+      3. Call the inference layer with a constrained response schema,
+         walking the model fallback chain on 404.
       4. Re-validate and normalise before anything reaches the browser.
     """
     client_ip = resolve_client_ip(request)
@@ -535,30 +599,13 @@ async def geo_audit(payload: AuditRequest, request: Request) -> JSONResponse:
 
     # --- Step 3: inference -------------------------------------------------
     try:
-        client = get_genai_client()
-
-        response = await client.aio.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=build_user_prompt(payload.brand_name, payload.target_url),
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_INSTRUCTION,
-                temperature=0.35,            # Low variance for repeatable scoring.
-                top_p=0.9,
-                max_output_tokens=2048,
-                response_mime_type="application/json",
-                response_schema=GeoAuditResult,   # Hard structural guarantee.
-            ),
-        )
-
-        raw_text = (response.text or "").strip()
-        if not raw_text:
-            raise ValueError("empty completion returned by the inference layer")
-
+        raw_text = await generate_audit_completion(payload.brand_name, payload.target_url)
         result = reconcile_payload(extract_json_object(raw_text))
         GeoAuditResult(**result)   # Final type gate before egress.
 
     except RuntimeError as exc:
-        # Missing credential — configuration fault, not the caller's fault.
+        # Missing credential, or every model in the chain was unreachable —
+        # configuration fault, not the caller's fault.
         rate_limiter.refund(client_ip)
         log.error("Configuration fault: %s", exc)
         return JSONResponse(
